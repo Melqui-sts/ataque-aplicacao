@@ -600,11 +600,10 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
             if (!isRunning) {{
                 const targetRam = parseInt(ramTargetSlider.value, 10);
                 if (targetRam >= 96) {{
-                    const proceed = confirm(
-                        "⚠️ AVISO DE USO EXTREMO (" + targetRam + "% RAM):\n\n" +
-                        "Você configurou " + targetRam + "% de uso de RAM. Isso provocará o esgotamento total da memória física da VM, podendo congelar a interface ou acionar o Linux OOM Killer.\n\nDeseja realmente continuar com essa carga?"
-                    );
-                    if (!proceed) return;
+                    const msg = "⚠️ AVISO DE USO EXTREMO (" + targetRam + "% RAM):\\n\\n" +
+                                "Voce configurou " + targetRam + "% de uso de RAM. Isso provocara o esgotamento total da memoria fisica da VM, podendo congelar a interface ou acionar o Linux OOM Killer.\\n\\n" +
+                                "Deseja realmente continuar com essa carga?";
+                    if (!confirm(msg)) return;
                 }}
             }}
 

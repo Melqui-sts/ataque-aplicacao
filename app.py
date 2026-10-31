@@ -386,6 +386,18 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
             flex-wrap: wrap;
             gap: 10px;
         }}
+        .critical-ram-warning {{
+            display: none;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.5);
+            color: #fca5a5;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 0.82rem;
+            margin-top: 0.6rem;
+            line-height: 1.4;
+            animation: pulse 1.5s infinite;
+        }}
     </style>
 </head>
 <body>
@@ -471,11 +483,14 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
                         </div>
                     </div>
 
-                    <div class="form-group">
+                    <div class="form-group" style="grid-column: span 12;">
                         <label for="ramTargetSlider">Limite Alvo de RAM (%)</label>
                         <div class="slider-container">
-                            <input type="range" id="ramTargetSlider" min="50" max="98" value="88">
-                            <span id="ramTargetVal" class="slider-val">88%</span>
+                            <input type="range" id="ramTargetSlider" min="50" max="100" value="85">
+                            <span id="ramTargetVal" class="slider-val">85%</span>
+                        </div>
+                        <div id="ramWarningBox" class="critical-ram-warning">
+                            🚨 <strong>ALERTA DE USO EXTREMO (100%):</strong> Alocar 100% da RAM física forçará o esgotamento total de memória da VM. O kernel Linux acionará o <em>OOM Killer</em> (que pode derrubar o servidor ou a interface gráfica) ou congelará totalmente o sistema por swap thrashing.
                         </div>
                     </div>
                 </div>
@@ -509,7 +524,18 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
 
         const ramTargetSlider = document.getElementById('ramTargetSlider');
         const ramTargetVal = document.getElementById('ramTargetVal');
-        ramTargetSlider.oninput = () => {{ ramTargetVal.innerText = ramTargetSlider.value + '%'; }};
+        ramTargetSlider.oninput = () => {{
+            const val = parseInt(ramTargetSlider.value, 10);
+            ramTargetVal.innerText = val + '%';
+            const warnBox = document.getElementById('ramWarningBox');
+            if (val >= 96) {{
+                warnBox.style.display = 'block';
+                ramTargetVal.style.color = '#ef4444';
+            }} else {{
+                warnBox.style.display = 'none';
+                ramTargetVal.style.color = 'var(--accent-cyan)';
+            }}
+        }};
 
         async function fetchStats() {{
             try {{
@@ -571,6 +597,17 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
         }}
 
         async function toggleSimulation() {{
+            if (!isRunning) {{
+                const targetRam = parseInt(ramTargetSlider.value, 10);
+                if (targetRam >= 96) {{
+                    const proceed = confirm(
+                        "⚠️ AVISO DE USO EXTREMO (" + targetRam + "% RAM):\n\n" +
+                        "Você configurou " + targetRam + "% de uso de RAM. Isso provocará o esgotamento total da memória física da VM, podendo congelar a interface ou acionar o Linux OOM Killer.\n\nDeseja realmente continuar com essa carga?"
+                    );
+                    if (!proceed) return;
+                }}
+            }}
+
             const endpoint = isRunning ? '/api/simulation/stop' : '/api/simulation/start';
             const payload = {{
                 mode: document.getElementById('modeSelect').value,
@@ -611,11 +648,12 @@ while True:
 def ram_stress_loop(stop_event, target_percent=90):
     """
     Aloca e suja páginas de memória até atingir a porcentagem alvo configurada.
+    Se target_percent for 100, aloca até o limite físico da memória (ou MemoryError do SO).
     """
     chunk_size = 30 * 1024 * 1024  # 30 MB
     while not stop_event.is_set():
         mem = psutil.virtual_memory()
-        if mem.percent >= target_percent:
+        if target_percent < 100 and mem.percent >= target_percent:
             time.sleep(0.3)
             continue
         try:

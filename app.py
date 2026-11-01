@@ -6,8 +6,10 @@ quantidade de núcleos (2, 4, 8+) sem deadlock de fork, e controle preciso de RA
 """
 
 import gc
+import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -20,6 +22,19 @@ import psutil
 # Detecta configuração da máquina
 CPU_COUNT = os.cpu_count() or 2
 
+def get_local_ip():
+    """Detecta o IP da máquina na rede local para exibir no painel."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+LOCAL_IP = get_local_ip()
+
 # Estado global da aplicação
 system_state = {
     "simulation_running": False,
@@ -27,6 +42,7 @@ system_state = {
     "concurrency": CPU_COUNT,
     "target_ram": 90,  # percentual alvo configurável
     "requests_processed": 0,
+    "network_requests_received": 0,
     "allocated_ram_chunks": [],
     "cpu_subprocesses": [],
     "stop_event": threading.Event(),
@@ -404,7 +420,10 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
     <div class="container">
         <header>
             <div class="header-title">
-                <h1>Painel de Resiliência e Carga (Camada de Aplicação)</h1>
+                <h1>Painel de Resiliência e Carga (Camada de Aplicação - L7)</h1>
+                <div style="margin-top: 0.4rem; font-family: var(--font-code); font-size: 0.85rem; color: #38bdf8;">
+                    📡 IP do Servidor na Rede Local: <strong>http://{LOCAL_IP}:8080</strong>
+                </div>
             </div>
             <div id="statusBadge" class="status-badge">
                 <span class="status-dot"></span>
@@ -510,6 +529,7 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
 
             <!-- Telemetria -->
             <div class="logs-card">
+                <span>Requisições L7 Recebidas (Rede): <strong id="netReqCount" style="color: #38bdf8;">0</strong></span>
                 <span>Processos Ativos de CPU: <strong id="activeProcCount" style="color: #fff;">0</strong></span>
                 <span>Memória Retida pela Aplicação: <strong id="appCacheMb" style="color: #fff;">0 MB</strong></span>
             </div>
@@ -558,6 +578,7 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
                 document.getElementById('swapDetails').innerText = `${{data.swap_used_gb.toFixed(2)}} GB de ${{data.swap_total_gb.toFixed(2)}} GB (${{data.swap_percent.toFixed(0)}}%)`;
 
                 // Telemetria
+                document.getElementById('netReqCount').innerText = (data.network_requests_received || 0).toLocaleString();
                 document.getElementById('activeProcCount').innerText = data.active_workers;
                 document.getElementById('appCacheMb').innerText = data.app_cache_mb + ' MB';
 
@@ -702,6 +723,7 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
                     "simulation_running": system_state["simulation_running"],
                     "active_workers": alive_workers,
                     "app_cache_mb": cache_size // (1024 * 1024),
+                    "network_requests_received": system_state["network_requests_received"],
                 }
 
             self.send_response(200)
@@ -722,7 +744,45 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
         except json.JSONDecodeError:
             data = {}
 
-        if parsed.path == "/api/simulation/start":
+        # Endpoint autêntico de Camada 7 para receber tráfego de rede da Máquina Atacante
+        if parsed.path == "/api/workload":
+            mode = data.get("mode", "both")
+            rounds = int(data.get("rounds", 12000))
+            chunk_mb = int(data.get("chunk_mb", 10))
+
+            start_t = time.time()
+
+            # 1. Carga de CPU sob demanda por requisição HTTP recebida da rede
+            if mode in ("cpu", "both"):
+                h = b"academic_l7_workload_payload" * 32
+                for _ in range(rounds):
+                    h = hashlib.sha256(h).digest()
+
+            # 2. Carga de RAM sob demanda por requisição HTTP recebida da rede
+            if mode in ("ram", "both"):
+                try:
+                    chunk = bytearray(b"\xff" * (chunk_mb * 1024 * 1024))
+                    with state_lock:
+                        system_state["allocated_ram_chunks"].append(chunk)
+                except MemoryError:
+                    pass
+
+            with state_lock:
+                system_state["network_requests_received"] += 1
+                system_state["requests_processed"] += 1
+
+            elapsed_ms = (time.time() - start_t) * 1000
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "processed",
+                "latency_ms": round(elapsed_ms, 2)
+            }).encode("utf-8"))
+            return
+
+        elif parsed.path == "/api/simulation/start":
             mode = data.get("mode", "both")
             concurrency = int(data.get("concurrency", CPU_COUNT))
             target_ram = int(data.get("target_ram", 88))
@@ -782,6 +842,7 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
         elif parsed.path == "/api/simulation/reset":
             with state_lock:
                 system_state["allocated_ram_chunks"].clear()
+                system_state["network_requests_received"] = 0
                 gc.collect()
 
             self.send_response(200)

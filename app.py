@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Laboratório de Teste de Carga e Resiliência na Camada de Aplicação (L7).
-Refatorado com subprocessos dedicados para garantir 100% de CPU real em qualquer
-quantidade de núcleos (2, 4, 8+) sem deadlock de fork, e controle preciso de RAM.
+Servidor Alvo — Painel de Monitoramento de Resiliência (Camada de Aplicação - L7).
+Projetado para atuar exclusivamente como VÍTIMA e PAINEL DE TELEMETRIA no laboratório de redes.
+Todo o tráfego e estresse de CPU/RAM são recebidos externamente da Máquina B.
 """
 
 import gc
@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -19,8 +18,8 @@ from socketserver import ThreadingMixIn
 import urllib.parse
 import psutil
 
-# Detecta configuração da máquina
 CPU_COUNT = os.cpu_count() or 2
+
 
 def get_local_ip():
     """Detecta o IP da máquina na rede local para exibir no painel."""
@@ -33,19 +32,15 @@ def get_local_ip():
     except Exception:
         return "127.0.0.1"
 
+
 LOCAL_IP = get_local_ip()
 
-# Estado global da aplicação
-system_state = {
-    "simulation_running": False,
-    "simulation_mode": "both",  # 'cpu', 'ram', 'both'
-    "concurrency": CPU_COUNT,
-    "target_ram": 90,  # percentual alvo configurável
-    "requests_processed": 0,
+# Estado do Servidor Alvo
+server_state = {
     "network_requests_received": 0,
     "allocated_ram_chunks": [],
-    "cpu_subprocesses": [],
-    "stop_event": threading.Event(),
+    "last_request_time": 0.0,
+    "start_time": time.time(),
 }
 
 state_lock = threading.Lock()
@@ -62,7 +57,7 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Laboratório de Carga e Resiliência (Camada de Aplicação - L7)</title>
+    <title>Servidor Alvo — Telemetria de Resiliência L7</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -74,7 +69,6 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
             --accent-cyan: #00f2fe;
             --accent-blue: #4facfe;
             --accent-red: #ff416c;
-            --accent-orange: #ff4b2b;
             --accent-emerald: #10b981;
             --accent-amber: #f59e0b;
             --text-primary: #f8fafc;
@@ -112,6 +106,8 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
             align-items: center;
             border-bottom: 1px solid var(--bg-card-border);
             padding-bottom: 1.5rem;
+            flex-wrap: wrap;
+            gap: 1rem;
         }}
 
         .header-title h1 {{
@@ -123,14 +119,28 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
             -webkit-text-fill-color: transparent;
         }}
 
+        .ip-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 0.4rem;
+            font-family: var(--font-code);
+            font-size: 0.88rem;
+            color: #38bdf8;
+            background: rgba(56, 189, 248, 0.1);
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: 1px solid rgba(56, 189, 248, 0.25);
+        }}
+
         .status-badge {{
             display: inline-flex;
             align-items: center;
             gap: 8px;
-            padding: 6px 14px;
+            padding: 8px 16px;
             border-radius: 9999px;
             font-size: 0.85rem;
-            font-weight: 600;
+            font-weight: 700;
             background: rgba(16, 185, 129, 0.1);
             color: var(--accent-emerald);
             border: 1px solid rgba(16, 185, 129, 0.3);
@@ -138,22 +148,22 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
         }}
 
         .status-badge.active {{
-            background: rgba(255, 65, 108, 0.15);
+            background: rgba(255, 65, 108, 0.18);
             color: var(--accent-red);
-            border-color: rgba(255, 65, 108, 0.4);
-            animation: pulse 1.5s infinite;
+            border-color: rgba(255, 65, 108, 0.5);
+            animation: pulse 1.2s infinite;
         }}
 
         .status-dot {{
-            width: 8px;
-            height: 8px;
+            width: 9px;
+            height: 9px;
             border-radius: 50%;
             background-color: currentColor;
         }}
 
         @keyframes pulse {{
             0%, 100% {{ opacity: 1; transform: scale(1); }}
-            50% {{ opacity: 0.7; transform: scale(1.15); }}
+            50% {{ opacity: 0.7; transform: scale(1.2); }}
         }}
 
         .grid {{
@@ -200,7 +210,7 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
 
         .metric-value {{
             font-family: var(--font-code);
-            font-size: 2rem;
+            font-size: 2.1rem;
             font-weight: 700;
         }}
 
@@ -237,182 +247,64 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
             font-family: var(--font-code);
         }}
 
-        .alert-box {{
+        .info-card {{
             grid-column: span 12;
-            background: linear-gradient(90deg, rgba(245, 158, 11, 0.12) 0%, rgba(239, 68, 68, 0.08) 100%);
-            border: 1px solid rgba(245, 158, 11, 0.35);
-            border-left: 4px solid #f59e0b;
-            border-radius: 12px;
-            padding: 1.1rem 1.4rem;
+            background: linear-gradient(90deg, rgba(56, 189, 248, 0.08) 0%, rgba(99, 102, 241, 0.08) 100%);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            border-radius: 14px;
+            padding: 1.25rem 1.5rem;
             display: flex;
-            gap: 1rem;
-            align-items: flex-start;
-        }}
-
-        .alert-icon {{
-            font-size: 1.5rem;
-            line-height: 1;
-            flex-shrink: 0;
-        }}
-
-        .alert-content h3 {{
-            font-size: 0.95rem;
-            font-weight: 700;
-            color: #fbbf24;
-            margin-bottom: 0.3rem;
-            display: flex;
+            justify-content: space-between;
             align-items: center;
-            gap: 8px;
+            flex-wrap: wrap;
+            gap: 1rem;
         }}
 
-        .alert-content p {{
+        .info-text h3 {{
+            font-size: 1rem;
+            font-weight: 700;
+            color: #38bdf8;
+            margin-bottom: 0.25rem;
+        }}
+
+        .info-text p {{
             font-size: 0.85rem;
             color: #cbd5e1;
             line-height: 1.5;
         }}
 
-        .alert-tag {{
-            background: rgba(245, 158, 11, 0.2);
-            color: #fbbf24;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 0.75rem;
-            font-family: var(--font-code);
-        }}
-
-        .control-card {{
-            grid-column: span 12;
-            display: flex;
-            flex-direction: column;
-            gap: 1.5rem;
-        }}
-
-        .form-row {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 1.5rem;
-        }}
-
-        .form-group {{
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }}
-
-        label {{
-            font-size: 0.85rem;
-            font-weight: 600;
-            color: var(--text-muted);
-        }}
-
-        select, input[type="range"] {{
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid var(--bg-card-border);
+        .btn-reset {{
+            background: rgba(255, 255, 255, 0.08);
             color: var(--text-primary);
-            padding: 10px 14px;
+            border: 1px solid var(--bg-card-border);
+            padding: 10px 18px;
             border-radius: 8px;
-            font-size: 0.95rem;
+            font-size: 0.88rem;
+            font-weight: 600;
             font-family: var(--font-main);
-            outline: none;
-        }}
-
-        select option {{
-            background: #111827;
-            color: #fff;
-        }}
-
-        .slider-container {{
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }}
-
-        .slider-val {{
-            font-family: var(--font-code);
-            font-weight: bold;
-            min-width: 45px;
-            color: var(--accent-cyan);
-        }}
-
-        .actions-row {{
-            display: flex;
-            gap: 1rem;
-            align-items: center;
-            flex-wrap: wrap;
-        }}
-
-        button {{
-            border: none;
-            padding: 12px 24px;
-            border-radius: 10px;
-            font-size: 0.95rem;
-            font-weight: 700;
             cursor: pointer;
             transition: all 0.2s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            font-family: var(--font-main);
-        }}
-
-        .btn-start {{
-            background: linear-gradient(135deg, #ff416c, #ff4b2b);
-            color: #fff;
-            box-shadow: 0 4px 15px rgba(255, 75, 43, 0.4);
-        }}
-
-        .btn-start:hover {{
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(255, 75, 43, 0.6);
-        }}
-
-        .btn-stop {{
-            background: rgba(255, 255, 255, 0.1);
-            color: var(--text-primary);
-            border: 1px solid var(--bg-card-border);
-        }}
-
-        .btn-stop:hover {{
-            background: rgba(255, 255, 255, 0.18);
-        }}
-
-        .btn-reset {{
-            background: transparent;
-            color: var(--text-muted);
-            border: 1px dashed var(--bg-card-border);
         }}
 
         .btn-reset:hover {{
-            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.16);
             border-color: rgba(255, 255, 255, 0.4);
         }}
 
         .logs-card {{
             grid-column: span 12;
-            background: rgba(5, 8, 15, 0.9);
+            background: rgba(5, 8, 15, 0.95);
             border-radius: 12px;
-            padding: 1rem 1.25rem;
+            padding: 1.1rem 1.4rem;
             border: 1px solid var(--bg-card-border);
             font-family: var(--font-code);
-            font-size: 0.82rem;
+            font-size: 0.85rem;
             color: #a5b4fc;
             display: flex;
             justify-content: space-between;
             align-items: center;
             flex-wrap: wrap;
-            gap: 10px;
-        }}
-        .critical-ram-warning {{
-            display: none;
-            background: rgba(239, 68, 68, 0.15);
-            border: 1px solid rgba(239, 68, 68, 0.5);
-            color: #fca5a5;
-            padding: 10px 14px;
-            border-radius: 8px;
-            font-size: 0.82rem;
-            margin-top: 0.6rem;
-            line-height: 1.4;
-            animation: pulse 1.5s infinite;
+            gap: 12px;
         }}
     </style>
 </head>
@@ -420,30 +312,18 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
     <div class="container">
         <header>
             <div class="header-title">
-                <h1>Painel de Resiliência e Carga (Camada de Aplicação - L7)</h1>
-                <div style="margin-top: 0.4rem; font-family: var(--font-code); font-size: 0.85rem; color: #38bdf8;">
-                    📡 IP do Servidor na Rede Local: <strong>http://{LOCAL_IP}:8080</strong>
+                <h1>Painel de Telemetria — Servidor Alvo (L7)</h1>
+                <div class="ip-badge">
+                    📡 Escutando na Rede: <strong>http://{LOCAL_IP}:8080</strong>
                 </div>
             </div>
             <div id="statusBadge" class="status-badge">
                 <span class="status-dot"></span>
-                <span id="statusText">Sistema Ocioso</span>
+                <span id="statusText">Aguardando Tráfego da Rede</span>
             </div>
         </header>
 
         <div class="grid">
-            <!-- Alerta de Simulação de Alta Carga (HTTP Flood L7) -->
-            <div class="alert-box">
-                <div class="alert-icon">⚠️</div>
-                <div class="alert-content">
-                    <h3>AVISO DE ALTA CARGA <span class="alert-tag">SIMULAÇÃO HTTP FLOOD (L7)</span></h3>
-                    <p>
-                        Este experimento dispara carga computacional nos processadores e preenche blocos físicos de RAM. 
-                        Recomendado testar inicialmente com RAM Alvo em <strong>85%</strong> para verificar o comportamento da VM sem congelar a interface gráfica do sistema operacional.
-                    </p>
-                </div>
-            </div>
-
             <!-- Métrica de CPU -->
             <div class="card metric-card">
                 <div class="metric-header">
@@ -480,83 +360,30 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
                 <div class="metric-sub" id="swapDetails">0 GB / 0 GB usados</div>
             </div>
 
-            <!-- Painel de Controle da Simulação L7 -->
-            <div class="card control-card">
-                <h2 style="font-size: 1.15rem; font-weight: 700;">Configurar e Disparar Teste de Carga L7</h2>
-                
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="modeSelect">Tipo de Carga da Aplicação</label>
-                        <select id="modeSelect">
-                            <option value="both">Carga Total (CPU em Todos os Núcleos + RAM)</option>
-                            <option value="cpu">Somente CPU (Saturação de Todos os Núcleos)</option>
-                            <option value="ram">Somente RAM (Alocação Gradual até o Alvo)</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="concurrencySlider">Processos Concorrentes de CPU</label>
-                        <div class="slider-container">
-                            <input type="range" id="concurrencySlider" min="1" max="{max(CPU_COUNT * 2, 8)}" value="{CPU_COUNT}">
-                            <span id="concurrencyVal" class="slider-val">{CPU_COUNT}</span>
-                        </div>
-                    </div>
-
-                    <div class="form-group" style="grid-column: span 12;">
-                        <label for="ramTargetSlider">Limite Alvo de RAM (%)</label>
-                        <div class="slider-container">
-                            <input type="range" id="ramTargetSlider" min="50" max="100" value="85">
-                            <span id="ramTargetVal" class="slider-val">85%</span>
-                        </div>
-                        <div id="ramWarningBox" class="critical-ram-warning">
-                            🚨 <strong>ALERTA DE USO EXTREMO (100%):</strong> Alocar 100% da RAM física forçará o esgotamento total de memória da VM. O kernel Linux acionará o <em>OOM Killer</em> (que pode derrubar o servidor ou a interface gráfica) ou congelará totalmente o sistema por swap thrashing.
-                        </div>
-                    </div>
+            <!-- Informações de Arquitetura e Reset -->
+            <div class="info-card">
+                <div class="info-text">
+                    <h3>🏛️ Modo de Operação: Alvo Passivo na Rede</h3>
+                    <p>
+                        Este servidor está recebendo e processando tráfego HTTP autêntico no endpoint <code>POST /api/workload</code>.<br>
+                        Para disparar o teste, execute o <code>client_flood.py</code> na <strong>Máquina B (Atacante)</strong> apontando para <strong>http://{LOCAL_IP}:8080</strong>.
+                    </p>
                 </div>
-
-                <div class="actions-row">
-                    <button id="btnToggle" class="btn-start" onclick="toggleSimulation()">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M8 5v14l11-7z"/>
-                        </svg>
-                        Iniciar Teste de Carga
-                    </button>
-                    <button class="btn-reset" onclick="resetMemory()">
-                        Limpar Memória Alocada
-                    </button>
-                </div>
+                <button class="btn-reset" onclick="resetMemory()">
+                    🧹 Limpar Memória / Resetar Contadores
+                </button>
             </div>
 
-            <!-- Telemetria -->
+            <!-- Telemetria em Tempo Real -->
             <div class="logs-card">
-                <span>Requisições L7 Recebidas (Rede): <strong id="netReqCount" style="color: #38bdf8;">0</strong></span>
-                <span>Processos Ativos de CPU: <strong id="activeProcCount" style="color: #fff;">0</strong></span>
-                <span>Memória Retida pela Aplicação: <strong id="appCacheMb" style="color: #fff;">0 MB</strong></span>
+                <span>Requisições L7 Recebidas: <strong id="netReqCount" style="color: #38bdf8;">0</strong></span>
+                <span>Memória Retida no Heap: <strong id="appCacheMb" style="color: #fff;">0 MB</strong></span>
+                <span>Tempo Ativo: <strong id="uptimeVal" style="color: #fff;">0s</strong></span>
             </div>
         </div>
     </div>
 
     <script>
-        let isRunning = false;
-        const concurrencySlider = document.getElementById('concurrencySlider');
-        const concurrencyVal = document.getElementById('concurrencyVal');
-        concurrencySlider.oninput = () => {{ concurrencyVal.innerText = concurrencySlider.value; }};
-
-        const ramTargetSlider = document.getElementById('ramTargetSlider');
-        const ramTargetVal = document.getElementById('ramTargetVal');
-        ramTargetSlider.oninput = () => {{
-            const val = parseInt(ramTargetSlider.value, 10);
-            ramTargetVal.innerText = val + '%';
-            const warnBox = document.getElementById('ramWarningBox');
-            if (val >= 96) {{
-                warnBox.style.display = 'block';
-                ramTargetVal.style.color = '#ef4444';
-            }} else {{
-                warnBox.style.display = 'none';
-                ramTargetVal.style.color = 'var(--accent-cyan)';
-            }}
-        }};
-
         async function fetchStats() {{
             try {{
                 const res = await fetch('/api/stats');
@@ -577,75 +404,28 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
                 document.getElementById('swapBar').style.width = Math.min(100, data.swap_percent) + '%';
                 document.getElementById('swapDetails').innerText = `${{data.swap_used_gb.toFixed(2)}} GB de ${{data.swap_total_gb.toFixed(2)}} GB (${{data.swap_percent.toFixed(0)}}%)`;
 
-                // Telemetria
+                // Telemetria de Rede
                 document.getElementById('netReqCount').innerText = (data.network_requests_received || 0).toLocaleString();
-                document.getElementById('activeProcCount').innerText = data.active_workers;
                 document.getElementById('appCacheMb').innerText = data.app_cache_mb + ' MB';
+                document.getElementById('uptimeVal').innerText = data.uptime_sec + 's';
 
-                isRunning = data.simulation_running;
-                updateButtonUI();
+                // Atualiza badge de tráfego ativo
+                const badge = document.getElementById('statusBadge');
+                const badgeText = document.getElementById('statusText');
+                if (data.is_under_attack) {{
+                    badge.className = 'status-badge active';
+                    badgeText.innerText = '🚨 Sob Tráfego L7 Ativo';
+                }} else {{
+                    badge.className = 'status-badge';
+                    badgeText.innerText = 'Aguardando Tráfego da Rede';
+                }}
             }} catch (err) {{
                 console.error("Falha ao obter status:", err);
             }}
         }}
 
-        function updateButtonUI() {{
-            const btn = document.getElementById('btnToggle');
-            const badge = document.getElementById('statusBadge');
-            const badgeText = document.getElementById('statusText');
-
-            if (isRunning) {{
-                btn.className = 'btn-stop';
-                btn.innerHTML = `
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-                        <rect x="6" y="6" width="12" height="12"/>
-                    </svg>
-                    Interromper Teste
-                `;
-                badge.className = 'status-badge active';
-                badgeText.innerText = 'Carga Ativa na Aplicação';
-            }} else {{
-                btn.className = 'btn-start';
-                btn.innerHTML = `
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M8 5v14l11-7z"/>
-                    </svg>
-                    Iniciar Teste de Carga
-                `;
-                badge.className = 'status-badge';
-                badgeText.innerText = 'Sistema Ocioso';
-            }}
-        }}
-
-        async function toggleSimulation() {{
-            if (!isRunning) {{
-                const targetRam = parseInt(ramTargetSlider.value, 10);
-                if (targetRam >= 96) {{
-                    const msg = "⚠️ AVISO DE USO EXTREMO (" + targetRam + "% RAM):\\n\\n" +
-                                "Voce configurou " + targetRam + "% de uso de RAM. Isso provocara o esgotamento total da memoria fisica da VM, podendo congelar a interface ou acionar o Linux OOM Killer.\\n\\n" +
-                                "Deseja realmente continuar com essa carga?";
-                    if (!confirm(msg)) return;
-                }}
-            }}
-
-            const endpoint = isRunning ? '/api/simulation/stop' : '/api/simulation/start';
-            const payload = {{
-                mode: document.getElementById('modeSelect').value,
-                concurrency: parseInt(concurrencySlider.value, 10),
-                target_ram: parseInt(ramTargetSlider.value, 10)
-            }};
-
-            await fetch(endpoint, {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/json' }},
-                body: JSON.stringify(payload)
-            }});
-
-            fetchStats();
-        }}
-
         async function resetMemory() {{
-            await fetch('/api/simulation/reset', {{ method: 'POST' }});
+            await fetch('/api/reset', {{ method: 'POST' }});
             fetchStats();
         }}
 
@@ -657,38 +437,9 @@ HTML_DASHBOARD = f"""<!DOCTYPE html>
 """
 
 
-# Código executado pelos processos isolados de CPU (garante 100% de 1 núcleo cada sem GIL)
-WORKER_CODE = """
-import sys
-while True:
-    _ = 123456789 * 987654321
-"""
-
-
-def ram_stress_loop(stop_event, target_percent=90):
-    """
-    Aloca e suja páginas de memória até atingir a porcentagem alvo configurada.
-    Se target_percent for 100, aloca até o limite físico da memória (ou MemoryError do SO).
-    """
-    chunk_size = 30 * 1024 * 1024  # 30 MB
-    while not stop_event.is_set():
-        mem = psutil.virtual_memory()
-        if target_percent < 100 and mem.percent >= target_percent:
-            time.sleep(0.3)
-            continue
-        try:
-            # Cria e preenche fisicamente com 0xFF
-            chunk = bytearray(b"\xff" * chunk_size)
-            with state_lock:
-                system_state["allocated_ram_chunks"].append(chunk)
-                system_state["requests_processed"] += 1
-            time.sleep(0.02)
-        except MemoryError:
-            time.sleep(0.5)
-
-
 class AppRequestHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
+        # Desativa logs no terminal para economizar I/O durante o teste
         return
 
     def do_GET(self):
@@ -706,11 +457,12 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
             mem = psutil.virtual_memory()
             swap = psutil.swap_memory()
 
+            now = time.time()
             with state_lock:
-                cache_size = sum(len(c) for c in system_state["allocated_ram_chunks"])
-                alive_workers = sum(
-                    1 for p in system_state["cpu_subprocesses"] if p.poll() is None
-                )
+                cache_size = sum(len(c) for c in server_state["allocated_ram_chunks"])
+                is_under_attack = (now - server_state["last_request_time"]) < 2.5
+                uptime = int(now - server_state["start_time"])
+
                 payload = {
                     "cpu_percent": cpu_pct,
                     "cpu_count": CPU_COUNT,
@@ -720,10 +472,10 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
                     "swap_percent": swap.percent,
                     "swap_used_gb": swap.used / (1024**3),
                     "swap_total_gb": swap.total / (1024**3),
-                    "simulation_running": system_state["simulation_running"],
-                    "active_workers": alive_workers,
+                    "network_requests_received": server_state["network_requests_received"],
                     "app_cache_mb": cache_size // (1024 * 1024),
-                    "network_requests_received": system_state["network_requests_received"],
+                    "is_under_attack": is_under_attack,
+                    "uptime_sec": uptime,
                 }
 
             self.send_response(200)
@@ -744,10 +496,10 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
         except json.JSONDecodeError:
             data = {}
 
-        # Endpoint autêntico de Camada 7 para receber tráfego de rede da Máquina Atacante
+        # Endpoint autêntico de Camada 7 para receber tráfego da Máquina Atacante
         if parsed.path == "/api/workload":
             mode = data.get("mode", "both")
-            rounds = int(data.get("rounds", 12000))
+            rounds = int(data.get("rounds", 15000))
             chunk_mb = int(data.get("chunk_mb", 10))
 
             start_t = time.time()
@@ -763,15 +515,16 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
                 try:
                     chunk = bytearray(b"\xff" * (chunk_mb * 1024 * 1024))
                     with state_lock:
-                        system_state["allocated_ram_chunks"].append(chunk)
+                        server_state["allocated_ram_chunks"].append(chunk)
                 except MemoryError:
                     pass
 
+            now = time.time()
             with state_lock:
-                system_state["network_requests_received"] += 1
-                system_state["requests_processed"] += 1
+                server_state["network_requests_received"] += 1
+                server_state["last_request_time"] = now
 
-            elapsed_ms = (time.time() - start_t) * 1000
+            elapsed_ms = (now - start_t) * 1000
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -782,67 +535,10 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
             }).encode("utf-8"))
             return
 
-        elif parsed.path == "/api/simulation/start":
-            mode = data.get("mode", "both")
-            concurrency = int(data.get("concurrency", CPU_COUNT))
-            target_ram = int(data.get("target_ram", 88))
-
+        elif parsed.path in ("/api/reset", "/api/simulation/reset"):
             with state_lock:
-                if not system_state["simulation_running"]:
-                    system_state["simulation_running"] = True
-                    system_state["simulation_mode"] = mode
-                    system_state["concurrency"] = concurrency
-                    system_state["target_ram"] = target_ram
-                    system_state["stop_event"].clear()
-
-                    # 1. Inicia processos de CPU via subprocess.Popen (imune a deadlocks de fork)
-                    if mode in ("cpu", "both"):
-                        for _ in range(concurrency):
-                            proc = subprocess.Popen(
-                                [sys.executable, "-c", WORKER_CODE],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                            )
-                            system_state["cpu_subprocesses"].append(proc)
-
-                    # 2. Inicia thread de preenchimento controlado de RAM
-                    if mode in ("ram", "both"):
-                        t = threading.Thread(
-                            target=ram_stress_loop,
-                            args=(system_state["stop_event"], target_ram),
-                            daemon=True,
-                        )
-                        t.start()
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "started"}).encode("utf-8"))
-            return
-
-        elif parsed.path == "/api/simulation/stop":
-            with state_lock:
-                system_state["simulation_running"] = False
-                system_state["stop_event"].set()
-
-                # Mata todos os processos de CPU imediatamente
-                for p in system_state["cpu_subprocesses"]:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-                system_state["cpu_subprocesses"].clear()
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "stopped"}).encode("utf-8"))
-            return
-
-        elif parsed.path == "/api/simulation/reset":
-            with state_lock:
-                system_state["allocated_ram_chunks"].clear()
-                system_state["network_requests_received"] = 0
+                server_state["allocated_ram_chunks"].clear()
+                server_state["network_requests_received"] = 0
                 gc.collect()
 
             self.send_response(200)
@@ -860,24 +556,20 @@ def run_server(port=8080):
     server_address = ("0.0.0.0", port)
     httpd = ThreadedHTTPServer(server_address, AppRequestHandler)
     print("=" * 65)
-    print("  LABORATÓRIO DE CARGA E RESILIÊNCIA - CAMADA DE APLICAÇÃO")
+    print("  SERVIDOR ALVO — MONITORAMENTO DE RESILIÊNCIA (L7)")
     print("=" * 65)
     print(f"[*] Núcleos de CPU detectados: {CPU_COUNT}")
-    print(f"[*] Servidor rodando em: http://localhost:{port}")
-    print(f"[*] Acesse pelo navegador na VM ou na máquina host.")
+    print(f"[*] IP na Rede Local:          http://{LOCAL_IP}:{port}")
+    print(f"[*] Endpoint de Carga L7:      http://{LOCAL_IP}:{port}/api/workload")
+    print("=" * 65)
+    print("[*] Aguardando tráfego do client_flood.py da Máquina B...")
     print("    Pressione [Ctrl + C] no terminal para encerrar.")
     print("=" * 65)
 
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[!] Encerrando servidor e subprocessos...")
-        with state_lock:
-            for p in system_state["cpu_subprocesses"]:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
+        print("\n[!] Encerrando servidor alvo...")
         httpd.shutdown()
 
 

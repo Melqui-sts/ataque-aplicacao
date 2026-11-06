@@ -34,18 +34,35 @@ Experimento acadêmico de **Redes de Computadores** e **Sistemas Operacionais** 
 
 ## 📋 Pré-requisitos
 
-- **Python 3.8+** nas duas máquinas.
-- Biblioteca `psutil` instalada na Máquina A (Servidor):
+- **Python 3.5+** nas duas máquinas. Em laboratório de 32 bits, use uma
+  instalação de Python 3.5 compilada para a arquitetura do computador.
+- Somente bibliotecas da instalação padrão do Python são necessárias. A
+  biblioteca `psutil` é **opcional** na Máquina A: sem ela, o painel usa os
+  arquivos `/proc` do Linux para coletar CPU, RAM e swap.
+
+  Para usar `psutil` quando ela estiver disponível:
   ```bash
   pip install psutil
   # ou no Ubuntu/Debian:
   sudo apt install python3-psutil -y
   ```
----
+
+Confirme o interpretador antes de executar o experimento:
+```bash
+python3 --version
+# esperado: Python 3.5.x ou superior
+```
 
 ## 🚀 Passo a Passo da Apresentação no Laboratório
 
 ### 1. Na Máquina A (Servidor Alvo)
+*(Opcional, mas recomendado em máquinas antigas com HD mecânico)* Desative o **Swap** temporariamente para que o **OOM Killer** atue imediatamente ao atingir 100% da RAM física, evitando lentidão de disco (*Swap Thrashing*):
+```bash
+sudo swapoff -a
+# Para reativar o Swap após a apresentação:
+# sudo swapon -a
+```
+
 Inicie o servidor de aplicação:
 ```bash
 python3 app.py
@@ -79,6 +96,8 @@ Quando a RAM da Máquina A atinge 100%, o processo é encerrado pelo kernel. Par
 
 ```bash
 dmesg -T | grep -i -E "oom|killed process"
+# Caso a versão antiga do Linux não aceite a flag -T:
+dmesg | grep -i -E "oom|killed process"
 ```
 O Linux exibirá o registro do kernel comprovando o sacrifício do processo para evitar o travamento total da máquina:
 > `Out of memory: Killed process (python3)...`

@@ -11,6 +11,7 @@ import concurrent.futures
 import gc
 import hashlib
 import json
+import mmap
 import os
 import socket
 import sys
@@ -22,6 +23,14 @@ import urllib.parse
 # Reduz stack de cada thread de 8MB (padrao Linux) para 512KB para economizar memoria virtual
 try:
     threading.stack_size(512 * 1024)
+except Exception:
+    pass
+
+# Define prioridade maxima (1000) no OOM Killer do Linux para que o kernel mate
+# este processo imediatamente quando a RAM+Swap acabar (protegendo o SSH e o SO)
+try:
+    with open("/proc/self/oom_score_adj", "w") as _oom_f:
+        _oom_f.write("1000\n")
 except Exception:
     pass
 
@@ -111,6 +120,18 @@ def get_system_metrics():
     )
 
 
+def get_process_rss_mb():
+    """Retorna a memoria residente atual deste processo em MB no Linux."""
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (IOError, OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 def get_local_ip():
     """Detecta o IP da máquina na rede local para exibir no painel."""
     try:
@@ -128,7 +149,11 @@ LOCAL_IP = get_local_ip()
 # Estado do Servidor Alvo
 server_state = {
     "network_requests_received": 0,
+    "network_requests_completed": 0,
+    "memory_allocation_failures": 0,
     "allocated_ram_chunks": [],
+    "virtual_oom_reserve": [],
+    "allocated_ram_bytes": 0,
     "last_request_time": 0.0,
     "start_time": time.time(),
 }
@@ -495,8 +520,9 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             <!-- Telemetria em Tempo Real -->
             <div class="logs-card">
-                <span>Requisições L7 Recebidas: <strong id="netReqCount" style="color: #38bdf8;">0</strong></span>
+                <span>L7 Aceitas / Concluídas: <strong id="netReqCount" style="color: #38bdf8;">0 / 0</strong></span>
                 <span>Memória Retida no Heap: <strong id="appCacheMb" style="color: #fff;">0 MB</strong></span>
+                <span>RAM Residente do Processo: <strong id="processRssMb" style="color: #fff;">0 MB</strong></span>
                 <span>Tempo Ativo: <strong id="uptimeVal" style="color: #fff;">0s</strong></span>
             </div>
         </div>
@@ -524,8 +550,11 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('swapDetails').innerText = data.swap_used_gb.toFixed(2) + ' GB de ' + data.swap_total_gb.toFixed(2) + ' GB (' + data.swap_percent.toFixed(0) + '%)';
 
                 // Telemetria de Rede
-                document.getElementById('netReqCount').innerText = (data.network_requests_received || 0).toLocaleString();
+                document.getElementById('netReqCount').innerText =
+                    (data.network_requests_received || 0).toLocaleString() + ' / ' +
+                    (data.network_requests_completed || 0).toLocaleString();
                 document.getElementById('appCacheMb').innerText = data.app_cache_mb + ' MB';
+                document.getElementById('processRssMb').innerText = data.process_rss_mb + ' MB';
                 document.getElementById('uptimeVal').innerText = data.uptime_sec + 's';
 
                 // Atualiza badge de tráfego ativo
@@ -590,7 +619,7 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
 
             now = time.time()
             with state_lock:
-                cache_size = sum(len(c) for c in server_state["allocated_ram_chunks"])
+                cache_size = server_state["allocated_ram_bytes"]
                 is_under_attack = (now - server_state["last_request_time"]) < 2.5
                 uptime = int(now - server_state["start_time"])
 
@@ -604,7 +633,10 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
                     "swap_used_gb": swap_used_gb,
                     "swap_total_gb": swap_total_gb,
                     "network_requests_received": server_state["network_requests_received"],
+                    "network_requests_completed": server_state["network_requests_completed"],
+                    "memory_allocation_failures": server_state["memory_allocation_failures"],
                     "app_cache_mb": cache_size // (1024 * 1024),
+                    "process_rss_mb": get_process_rss_mb(),
                     "is_under_attack": is_under_attack,
                     "uptime_sec": uptime,
                 }
@@ -629,6 +661,13 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
 
         # Endpoint autêntico de Camada 7 para receber tráfego da Máquina Atacante
         if parsed.path == "/api/workload":
+            now = time.time()
+            with state_lock:
+                # "Recebida" significa que o servidor aceitou e leu o POST;
+                # o processamento pesado ainda pode estar em andamento.
+                server_state["network_requests_received"] += 1
+                server_state["last_request_time"] = now
+
             mode = data.get("mode", "both")
             rounds = int(data.get("rounds", 250000))
             chunk_mb = int(data.get("chunk_mb", 40))
@@ -644,32 +683,64 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
                     rounds,
                 )
 
-            # 2. Carga de RAM sob demanda sem limite (vai ate 100% da RAM + SWAP)
+            # 2. Carga de RAM sob demanda sem limite (vai ate 100% da RAM + SWAP e aciona o OOM Killer)
             if mode in ("ram", "both"):
+                size_bytes = chunk_mb * 1024 * 1024
+
+                # Pre-mapeia reserva de memoria virtual (0 MB de RAM fisica ate ser tocada).
+                # Quando a RAM chegar perto de 98% e o malloc bloquear novos bytearrays com MemoryError,
+                # sujar essas paginas ja mapeadas forca Page Fault real no kernel e dispara o OOM Killer!
+                with state_lock:
+                    if not server_state["virtual_oom_reserve"] and server_state["memory_allocation_failures"] == 0:
+                        try:
+                            for _ in range(32):
+                                server_state["virtual_oom_reserve"].append(
+                                    mmap.mmap(-1, 32 * 1024 * 1024)
+                                )
+                        except Exception:
+                            pass
+
                 try:
-                    size_bytes = chunk_mb * 1024 * 1024
                     chunk = bytearray(size_bytes)
-                    # Toca cada pagina de 4KB para forcar alocacao fisica imediata na RAM/SWAP
                     for offset in range(0, size_bytes, 4096):
                         chunk[offset] = 1
                     with state_lock:
                         server_state["allocated_ram_chunks"].append(chunk)
+                        server_state["allocated_ram_bytes"] += len(chunk)
                 except MemoryError:
-                    # Quando o bloco grande de 40MB nao couber no finalzinho da RAM,
-                    # preenche os ultimos megabytes restantes com blocos menores de 2MB ate chegar em 100%
-                    try:
-                        small_bytes = 2 * 1024 * 1024
-                        small_chunk = bytearray(small_bytes)
-                        for offset in range(0, small_bytes, 4096):
-                            small_chunk[offset] = 1
+                    with state_lock:
+                        server_state["memory_allocation_failures"] += 1
+
+                    # 2a. Tenta alocar blocos menores (ate 512 KB) para esgotar o malloc sem travar o state_lock
+                    fallback_size = size_bytes // 2
+                    while fallback_size >= 524288:
+                        try:
+                            small_chunk = bytearray(fallback_size)
+                            for offset in range(0, fallback_size, 4096):
+                                small_chunk[offset] = 1
+                            with state_lock:
+                                server_state["allocated_ram_chunks"].append(small_chunk)
+                                server_state["allocated_ram_bytes"] += len(small_chunk)
+                        except MemoryError:
+                            fallback_size //= 2
+
+                    # 2b. Toca nas paginas da reserva virtual pre-mapeada para forcar Page Fault
+                    # nos ultimos megabytes da RAM fisica e acionar o OOM Killer do Linux (SIGKILL)
+                    while True:
                         with state_lock:
-                            server_state["allocated_ram_chunks"].append(small_chunk)
-                    except MemoryError:
-                        pass
+                            if not server_state["virtual_oom_reserve"]:
+                                break
+                            vchunk = server_state["virtual_oom_reserve"].pop()
+                        vsize = len(vchunk)
+                        for offset in range(0, vsize, 4096):
+                            vchunk[offset:offset + 1] = b"\x01"
+                        with state_lock:
+                            server_state["allocated_ram_chunks"].append(vchunk)
+                            server_state["allocated_ram_bytes"] += vsize
 
             now = time.time()
             with state_lock:
-                server_state["network_requests_received"] += 1
+                server_state["network_requests_completed"] += 1
                 server_state["last_request_time"] = now
 
             elapsed_ms = (now - start_t) * 1000
@@ -685,8 +756,17 @@ class AppRequestHandler(SimpleHTTPRequestHandler):
 
         elif parsed.path in ("/api/reset", "/api/simulation/reset"):
             with state_lock:
+                for chunk in server_state["virtual_oom_reserve"]:
+                    try:
+                        chunk.close()
+                    except Exception:
+                        pass
+                del server_state["virtual_oom_reserve"][:]
                 del server_state["allocated_ram_chunks"][:]
                 server_state["network_requests_received"] = 0
+                server_state["network_requests_completed"] = 0
+                server_state["memory_allocation_failures"] = 0
+                server_state["allocated_ram_bytes"] = 0
                 gc.collect()
 
             self.send_response(200)

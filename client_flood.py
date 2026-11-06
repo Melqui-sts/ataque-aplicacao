@@ -30,7 +30,7 @@ stats = {
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def send_workload_request(target_url, mode, rounds=12000, chunk_mb=10, timeout=10):
+def send_workload_request(target_url, mode, rounds=250000, chunk_mb=40, timeout=10):
     """Envia uma requisição HTTP POST para o endpoint /api/workload."""
     url = "{0}/api/workload".format(target_url.rstrip("/"))
     payload = json.dumps({
@@ -125,14 +125,14 @@ def main():
     parser.add_argument(
         "--rounds",
         type=int,
-        default=12000,
-        help="Iteracoes de hash por requisicao de CPU (padrao: 12000)",
+        default=250000,
+        help="Iteracoes de hash por requisicao de CPU (padrao: 250000)",
     )
     parser.add_argument(
         "--chunk-mb",
         type=int,
-        default=10,
-        help="Megabytes de RAM alocados por requisicao (padrao: 10)",
+        default=40,
+        help="Megabytes de RAM alocados por requisicao (padrao: 40)",
     )
 
     args = parser.parse_args()
